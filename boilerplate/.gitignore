@@ -1,0 +1,21 @@
+# Build files
+*.o
+*.ko
+engine
+cpu_hog
+memory_hog
+io_pulse
+
+# Root filesystems
+rootfs-base/
+rootfs-alpha/
+rootfs-beta/
+
+# Archives
+*.tar.gz
+
+# Logs
+logs/
+
+# VSCode
+.vscode/

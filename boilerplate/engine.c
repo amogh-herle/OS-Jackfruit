@@ -895,7 +895,7 @@ static void handle_control_request(supervisor_ctx_t *ctx, int client_fd)
             snprintf(resp.message, sizeof(resp.message),
                      "No running container with id '%s'", req.container_id);
         } else {
-            kill(target_pid, SIGTERM);
+            kill(target_pid, SIGKILL);
             resp.status = 0;
             snprintf(resp.message, sizeof(resp.message),
                      "Sent SIGTERM to container %s (pid %d)",
@@ -999,7 +999,7 @@ static int run_supervisor(const char *rootfs)
     struct sigaction sa_term;
     memset(&sa_term, 0, sizeof(sa_term));
     sa_term.sa_handler = sigterm_handler;
-    sa_term.sa_flags   = SA_RESTART;
+    sa_term.sa_flags   = 0  ;
     sigemptyset(&sa_term.sa_mask);
     sigaction(SIGINT,  &sa_term, NULL);
     sigaction(SIGTERM, &sa_term, NULL);
@@ -1017,8 +1017,11 @@ static int run_supervisor(const char *rootfs)
     while (!ctx.should_stop) {
         int client_fd = accept(ctx.server_fd, NULL, NULL);
         if (client_fd < 0) {
-            if (errno == EINTR)
-                continue;   /* interrupted by SIGCHLD or SIGTERM, loop */
+            if (errno == EINTR) {
+                if (ctx.should_stop)
+                    break;
+                continue; 
+              }  /* interrupted by SIGCHLD or SIGTERM, loop */
             perror("accept");
             break;
         }
@@ -1047,6 +1050,10 @@ static int run_supervisor(const char *rootfs)
     /* Drain and stop the log pipeline */
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     pthread_join(ctx.logger_thread, NULL);
+
+    close(ctx.server_fd);
+
+    printf("Supervisor exited cleanly.\n");
 
     /* Free all container metadata records */
     pthread_mutex_lock(&ctx.metadata_lock);
