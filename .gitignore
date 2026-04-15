@@ -1,1 +1,16 @@
-solved
+cat > .gitignore << 'EOF'
+rootfs*/
+logs/
+*.tar.gz
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.tmp_versions/
+engine
+cpu_hog
+io_pulse
+memory_hog
+EOF
