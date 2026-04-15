@@ -666,6 +666,13 @@ static pid_t launch_container(supervisor_ctx_t *ctx, const control_request_t *re
         return -1;
     }
 
+    /*
+     * The child runs on its own copy of the stack pages (COW after clone).
+     * The parent's mapping is no longer needed and must be freed to avoid
+     * a STACK_SIZE (1 MiB) leak per launched container.
+     */
+    free(stack);
+
     /* Parent closes the write end; only the child writes */
     close(pipefd[1]);
 
@@ -836,14 +843,33 @@ static void handle_control_request(supervisor_ctx_t *ctx, int client_fd)
             resp.status = -1;
             snprintf(resp.message, sizeof(resp.message),
                      "No log found for container %s", req.container_id);
-        } else {
-            ssize_t r = read(fd, resp.message, sizeof(resp.message) - 1);
-            if (r < 0) r = 0;
-            resp.message[r] = '\0';
-            resp.status = 0;
+            write(client_fd, &resp, sizeof(resp));
+            return;
+        }
+
+        /*
+         * Stream the log in CONTROL_MESSAGE_LEN-1 byte chunks so that large
+         * log files are not silently truncated to sizeof(resp.message)-1 bytes.
+         * Each chunk is sent as a separate response (status=0).
+         * A final EOF sentinel response (status=1, empty message) signals the
+         * client that all data has been delivered.
+         */
+        {
+            ssize_t r;
+            while ((r = read(fd, resp.message, sizeof(resp.message) - 1)) > 0) {
+                resp.message[r] = '\0';
+                resp.status = 0;
+                write(client_fd, &resp, sizeof(resp));
+                memset(&resp, 0, sizeof(resp));
+            }
             close(fd);
         }
-        break;
+
+        /* EOF sentinel */
+        memset(&resp, 0, sizeof(resp));
+        resp.status = 1;
+        write(client_fd, &resp, sizeof(resp));
+        return;
     }
 
     case CMD_STOP: {
@@ -881,6 +907,11 @@ static void handle_control_request(supervisor_ctx_t *ctx, int client_fd)
     default:
         resp.status = -1;
         snprintf(resp.message, sizeof(resp.message), "Unknown command");
+        break;
+    case CMD_SUPERVISOR:
+        /* CMD_SUPERVISOR is only valid as a process mode, not a control request */
+        resp.status = -1;
+        snprintf(resp.message, sizeof(resp.message), "Invalid command over socket");
         break;
     }
 
@@ -946,6 +977,8 @@ static int run_supervisor(const char *rootfs)
         close(ctx.server_fd);
         return 1;
     }
+
+    chmod(CONTROL_PATH, 0666);
 
     if (listen(ctx.server_fd, 8) < 0) {
         perror("listen");
@@ -1121,6 +1154,25 @@ static int cmd_start(int argc, char *argv[])
     return send_control_request(&req);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Signal forwarding for cmd_run                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * When the user presses Ctrl-C (SIGINT) or sends SIGTERM while `run` is
+ * blocking on a response, we must forward a stop request to the supervisor
+ * rather than simply dying.  g_run_container_id holds the container id that
+ * is currently being waited on, and g_run_interrupted is set by the handler.
+ */
+static volatile sig_atomic_t g_run_interrupted    = 0;
+static char                  g_run_container_id[CONTAINER_ID_LEN];
+
+static void run_sigforward_handler(int sig)
+{
+    (void)sig;
+    g_run_interrupted = 1;
+}
+
 static int cmd_run(int argc, char *argv[])
 {
     control_request_t req;
@@ -1154,7 +1206,78 @@ static int cmd_run(int argc, char *argv[])
             return 1;
     }
 
-    return send_control_request(&req);
+    /*
+     * Save the container id for the signal handler, then install handlers
+     * so that SIGINT/SIGTERM while we block on the supervisor's response
+     * results in a proper `stop <id>` forwarded to the supervisor.
+     */
+    strncpy(g_run_container_id, req.container_id, sizeof(g_run_container_id) - 1);
+    g_run_container_id[sizeof(g_run_container_id) - 1] = '\0';
+
+    struct sigaction sa_fwd, sa_old_int, sa_old_term;
+    memset(&sa_fwd, 0, sizeof(sa_fwd));
+    sa_fwd.sa_handler = run_sigforward_handler;
+    sigemptyset(&sa_fwd.sa_mask);
+    /* Do NOT use SA_RESTART: we want read() to return EINTR so we notice */
+    sigaction(SIGINT,  &sa_fwd, &sa_old_int);
+    sigaction(SIGTERM, &sa_fwd, &sa_old_term);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect (is the supervisor running?)");
+        close(fd);
+        sigaction(SIGINT,  &sa_old_int,  NULL);
+        sigaction(SIGTERM, &sa_old_term, NULL);
+        return 1;
+    }
+
+    if (write(fd, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
+        perror("write");
+        close(fd);
+        sigaction(SIGINT,  &sa_old_int,  NULL);
+        sigaction(SIGTERM, &sa_old_term, NULL);
+        return 1;
+    }
+
+    control_response_t resp;
+    ssize_t n = read(fd, &resp, sizeof(resp));
+    close(fd);
+
+    /* Restore original signal dispositions */
+    sigaction(SIGINT,  &sa_old_int,  NULL);
+    sigaction(SIGTERM, &sa_old_term, NULL);
+
+    if (g_run_interrupted) {
+        /*
+         * User hit Ctrl-C (or SIGTERM arrived) while waiting for the
+         * container to finish.  Forward a stop request to the supervisor
+         * so the container is terminated gracefully, then exit.
+         */
+        fprintf(stderr, "\nInterrupted — forwarding stop to container %s\n",
+                g_run_container_id);
+        control_request_t stop_req;
+        memset(&stop_req, 0, sizeof(stop_req));
+        stop_req.kind = CMD_STOP;
+        strncpy(stop_req.container_id, g_run_container_id,
+                sizeof(stop_req.container_id) - 1);
+        send_control_request(&stop_req);
+        return 130;  /* conventional exit code for Ctrl-C */
+    }
+
+    if (n != (ssize_t)sizeof(resp)) {
+        fprintf(stderr, "Truncated response from supervisor\n");
+        return 1;
+    }
+
+    printf("%s\n", resp.message);
+    return resp.status == 0 ? 0 : 1;
 }
 
 static int cmd_ps(void)
@@ -1167,17 +1290,63 @@ static int cmd_ps(void)
 
 static int cmd_logs(int argc, char *argv[])
 {
-    control_request_t req;
-
     if (argc < 3) {
         fprintf(stderr, "Usage: %s logs <id>\n", argv[0]);
         return 1;
     }
 
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return 1; }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect (is the supervisor running?)");
+        close(fd);
+        return 1;
+    }
+
+    control_request_t req;
     memset(&req, 0, sizeof(req));
     req.kind = CMD_LOGS;
     strncpy(req.container_id, argv[2], sizeof(req.container_id) - 1);
-    return send_control_request(&req);
+
+    if (write(fd, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
+        perror("write");
+        close(fd);
+        return 1;
+    }
+
+    /*
+     * The supervisor streams the log in chunks (status=0) followed by an
+     * EOF sentinel (status=1).  Print each chunk as it arrives so large
+     * logs are not truncated to a single 511-byte response.
+     */
+    control_response_t resp;
+    int ret = 0;
+    while (1) {
+        ssize_t n = read(fd, &resp, sizeof(resp));
+        if (n != (ssize_t)sizeof(resp)) {
+            fprintf(stderr, "Truncated response from supervisor\n");
+            ret = 1;
+            break;
+        }
+        if (resp.status == 1)   /* EOF sentinel */
+            break;
+        if (resp.status < 0) {
+            fprintf(stderr, "%s\n", resp.message);
+            ret = 1;
+            break;
+        }
+        printf("%s", resp.message);
+        fflush(stdout);
+    }
+
+    close(fd);
+    return ret;
 }
 
 static int cmd_stop(int argc, char *argv[])

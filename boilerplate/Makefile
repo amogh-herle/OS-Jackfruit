@@ -3,8 +3,6 @@ obj-m += monitor.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
-# For workload binaries that run inside Alpine rootfs: link statically.
-# Override with WORKLOAD_LDFLAGS= (empty) if your toolchain doesn't support -static.
 WORKLOAD_LDFLAGS ?= -static
 
 USER_TARGETS := engine memory_hog cpu_hog io_pulse
@@ -28,15 +26,14 @@ io_pulse: io_pulse.c
 monitor.ko: monitor.c monitor_ioctl.h
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-# CI target: compile user-space only (no kernel headers / sudo needed).
-# Used by GitHub Actions smoke check on hosted runners.
+# CI target: user-space only, no kernel headers needed (for GitHub Actions)
 ci: engine memory_hog cpu_hog io_pulse
 
 clean:
 	if [ -d "$(KDIR)" ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
 	rm -f $(USER_TARGETS) *.o *.mod *.mod.c *.symvers *.order
 	rm -f *.log
-	rm -rf logs
+	sudo rm -rf logs
 	rm -f /tmp/mini_runtime.sock
 
 .PHONY: all module ci clean
