@@ -36,7 +36,7 @@ sudo ./environment-check.sh
 
 ```bash
 cd boilerplate
-make
+make ci
 ```
 
 This produces: `engine`, `cpu_hog`, `io_pulse`, `memory_hog`, and `monitor.ko`.
@@ -50,6 +50,7 @@ tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
 
 cp -a ./rootfs-base ./rootfs-alpha
 cp -a ./rootfs-base ./rootfs-beta
+cp -a ./rootfs-base ./rootfs-gamma
 
 # Copy workload binaries into each rootfs
 cp cpu_hog memory_hog io_pulse ./rootfs-alpha/
@@ -61,7 +62,7 @@ cp cpu_hog memory_hog io_pulse ./rootfs-beta/
 ```bash
 sudo insmod monitor.ko
 ls -l /dev/container_monitor    # verify device exists
-dmesg | tail -3                 # should show: [container_monitor] Module loaded
+sudo dmesg | tail -3            # should show: [container_monitor] Module loaded
 ```
 
 ### Start the Supervisor (Terminal 1)
