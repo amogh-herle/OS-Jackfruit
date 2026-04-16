@@ -284,10 +284,10 @@ Two containers ran `/cpu_hog 20` (20-second burn) simultaneously on a single-cor
 
 | Container | Nice Value | Accumulator at t=10s | Accumulator at t=20s (final) |
 |-----------|-----------|----------------------|------------------------------|
-| high-pri  | -5        | [value from log]     | [value from log]             |
-| low-pri   | +15       | [value from log]     | [value from log]             |
+| high-pri  | -5        | 16299923291779256479 | 7467485672453948640          |
+| low-pri   | +15       | 1499376263926993758  | 8668971558365461990          |
 
-*(Fill in values from `./engine logs high-pri` and `./engine logs low-pri` after running the experiment.)*
+*(Values captured from `./engine logs high-pri` and `./engine logs low-pri`.)*
 
 **Expected outcome:** `high-pri` accumulates roughly 3–5× more loop iterations per second than `low-pri` because CFS assigns it a higher weight. Both complete within the 20-second window, but `high-pri` does significantly more work per wall-clock second.
 
