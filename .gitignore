@@ -13,4 +13,5 @@ engine
 cpu_hog
 io_pulse
 memory_hog
+rootfs-alpha
 EOF
